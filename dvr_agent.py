@@ -9,6 +9,11 @@ import ctypes
 import xml.etree.ElementTree as ET
 import requests
 from requests.auth import HTTPDigestAuth
+import queue
+import tkinter as tk
+from tkinter import ttk, scrolledtext
+import pystray
+from PIL import Image, ImageDraw
 
 import conecction_dvr
 
@@ -17,80 +22,39 @@ CONFIG_FILE = "config.json"
 
 class Config:
     def __init__(self):
-        config_data = {}
+        self.config_data = {}
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, 'r') as f:
-                    config_data = json.load(f)
+                    self.config_data = json.load(f)
             except Exception as e:
                 print(f"[-] Error leyendo {CONFIG_FILE}: {e}")
 
-        self.at_api_user = config_data.get("AT_API_USER")
-        if not self.at_api_user:
-            val = input("AT_API_USER [prevencion@apuestatotal.com]: ").strip()
-            self.at_api_user = val if val else "prevencion@apuestatotal.com"
+        self.at_api_user = self.config_data.get("AT_API_USER", "")
+        self.at_api_pass = self.config_data.get("AT_API_PASS", "")
+        self.dvr_user = self.config_data.get("DVR_USER", "admin")
+        self.dvr_pass = self.config_data.get("DVR_PASS", "")
+        self.dvr_ceco = self.config_data.get("DVR_CECO", "")
+        self.dvr_ip = self.config_data.get("DVR_IP", "")
+        self.sync_interval = self.config_data.get("SYNC_INTERVAL_MINUTES", 5)
 
-        self.at_api_pass = config_data.get("AT_API_PASS")
-        if not self.at_api_pass:
-            val = input("AT_API_PASS [**********]: ").strip()
-            self.at_api_pass = val if val else "Password123*"
-
-        self.dvr_user = config_data.get("DVR_USER")
-        if not self.dvr_user:
-            val = input("DVR_USER [admin]: ").strip()
-            self.dvr_user = val if val else "admin"
-
-        self.dvr_pass = config_data.get("DVR_PASS")
-        while not self.dvr_pass:
-            val = input("DVR_PASS (requerido): ").strip()
-            if val:
-                self.dvr_pass = val
-
-        self.dvr_ceco = config_data.get("DVR_CECO")
-        while not self.dvr_ceco:
-            val = input("DVR_CECO (requerido): ").strip()
-            if val:
-                self.dvr_ceco = val
-
-        self.dvr_ip = config_data.get("DVR_IP")
-        if not self.dvr_ip:
-            print("[*] Buscando DVR en la red local...")
-            devices = conecction_dvr.discover_hikvision(timeout=3)
-            if devices:
-                d_ip = devices[0]['ip']
-                d_port = devices[0].get('http_port', '80')
-                if d_port and d_port != '80':
-                    self.dvr_ip = f"{d_ip}:{d_port}"
-                else:
-                    self.dvr_ip = d_ip
-                print(f"[+] DVR encontrado en: {self.dvr_ip}")
-            else:
-                while not self.dvr_ip:
-                    val = input("No se encontró DVR. Ingrese DVR_IP manualmente: ").strip()
-                    if val:
-                        self.dvr_ip = val
-
-        self.sync_interval = config_data.get("SYNC_INTERVAL_MINUTES")
-        if not self.sync_interval:
-            val = input("SYNC_INTERVAL_MINUTES (minutos, enter para 5): ").strip()
-            self.sync_interval = int(val) if val.isdigit() else 5
-        else:
-            self.sync_interval = int(self.sync_interval)
-
-        # Guardar en config para evitar pedirlo la proxima vez
-        config_data["AT_API_USER"] = self.at_api_user
-        config_data["AT_API_PASS"] = self.at_api_pass
-        config_data["DVR_USER"] = self.dvr_user
-        config_data["DVR_PASS"] = self.dvr_pass
-        config_data["DVR_CECO"] = self.dvr_ceco
-        config_data["DVR_IP"] = self.dvr_ip
-        config_data["SYNC_INTERVAL_MINUTES"] = self.sync_interval
+    def save(self):
+        self.config_data["AT_API_USER"] = self.at_api_user
+        self.config_data["AT_API_PASS"] = self.at_api_pass
+        self.config_data["DVR_USER"] = self.dvr_user
+        self.config_data["DVR_PASS"] = self.dvr_pass
+        self.config_data["DVR_CECO"] = self.dvr_ceco
+        self.config_data["DVR_IP"] = self.dvr_ip
+        self.config_data["SYNC_INTERVAL_MINUTES"] = self.sync_interval
         
         try:
             with open(CONFIG_FILE, 'w') as f:
-                json.dump(config_data, f, indent=4)
+                json.dump(self.config_data, f, indent=4)
         except Exception as e:
             print(f"[-] Error guardando {CONFIG_FILE}: {e}")
+
+    def is_valid(self):
+        return all([self.at_api_user, self.at_api_pass, self.dvr_user, self.dvr_pass, self.dvr_ceco, self.dvr_ip])
 
 class ApuestaTotalClient:
     def __init__(self, user, password):
@@ -425,7 +389,7 @@ class HikvisionClient:
 def get_current_utc():
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
-def dvr_worker(config):
+def dvr_worker(config, stop_event):
     at_client = ApuestaTotalClient(config.at_api_user, config.at_api_pass)
     if not at_client.login():
         print("[-] Abortando ejecucion por fallo de login.")
@@ -437,22 +401,9 @@ def dvr_worker(config):
         print("[-] Abortando ejecucion, no se pudo contactar el DVR.")
         return
 
-    print("[*] ¡Validación exitosa! Ocultando la consola y pasando a segundo plano...")
-    time.sleep(2)
+    print("[*] ¡Validación exitosa! Ejecutando en segundo plano...")
     
-    if os.name == 'nt':
-        try:
-            log_file = open('dvr_agent.log', 'a', encoding='utf-8')
-            sys.stdout = log_file
-            sys.stderr = log_file
-            hWnd = ctypes.windll.kernel32.GetConsoleWindow()
-            if hWnd:
-                ctypes.windll.user32.ShowWindow(hWnd, 0)
-        except Exception:
-            pass
-        
     def handle_event(event_data):
-        # callback invocado por el stream de Hikvision
         event_payload = {
             "eventType": event_data["eventType"],
             "eventTime": get_current_utc(),
@@ -465,15 +416,12 @@ def dvr_worker(config):
         }
         at_client.post_event(event_payload)
 
-    # Iniciar el thread del stream de eventos
     event_thread = threading.Thread(target=hik_client.stream_events, args=(handle_event,), daemon=True)
     event_thread.start()
 
-    # Loop de actualizacion de Storage y Recording
-    while True:
-        print("\n[*] Recolectando status de grabacion y almacenamiento...")
+    while not stop_event.is_set():
+        print(f"\n[*] [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Recolectando status de grabacion y almacenamiento...")
         
-        # Storage
         storage_list = hik_client.fetch_storage_status()
         if storage_list:
             storage_payload = {
@@ -484,7 +432,6 @@ def dvr_worker(config):
             }
             at_client.post_storage_status(storage_payload)
 
-        # Recording
         recording_list = hik_client.fetch_recording_status()
         if recording_list:
             recording_payload = {
@@ -496,18 +443,191 @@ def dvr_worker(config):
             }
             at_client.post_recording_status(recording_payload)
             
-        # Esperar X minutos para el proximo envio
-        time.sleep(config.sync_interval * 60)
+        stop_event.wait(config.sync_interval * 60)
+
+class RedirectText(object):
+    def __init__(self, text_ctrl):
+        self.output = text_ctrl
+        self.queue = queue.Queue()
+        self.update_me()
+
+    def write(self, string):
+        self.queue.put(string)
+
+    def flush(self):
+        pass
+
+    def update_me(self):
+        try:
+            while True:
+                string = self.queue.get_nowait()
+                self.output.insert(tk.END, string)
+                self.output.see(tk.END)
+                self.output.update_idletasks()
+        except queue.Empty:
+            pass
+        self.output.after(100, self.update_me)
+
+class DvrAgentApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Agente DVR ApuestaTotal")
+        self.root.geometry("650x550")
+        
+        self.config = Config()
+        self.worker_thread = None
+        self.stop_event = threading.Event()
+        self.icon = None
+
+        self.setup_ui()
+        self.root.protocol('WM_DELETE_WINDOW', self.hide_window)
+
+        if self.config.is_valid():
+            self.start_agent()
+
+    def setup_ui(self):
+        form_frame = ttk.LabelFrame(self.root, text="Configuración")
+        form_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(form_frame, text="AT API User:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        self.ent_at_user = ttk.Entry(form_frame, width=25)
+        self.ent_at_user.insert(0, self.config.at_api_user)
+        self.ent_at_user.grid(row=0, column=1, padx=5, pady=2)
+        
+        ttk.Label(form_frame, text="AT API Pass:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=2)
+        self.ent_at_pass = ttk.Entry(form_frame, width=25, show="*")
+        self.ent_at_pass.insert(0, self.config.at_api_pass)
+        self.ent_at_pass.grid(row=0, column=3, padx=5, pady=2)
+        
+        ttk.Label(form_frame, text="DVR IP:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        self.ent_dvr_ip = ttk.Entry(form_frame, width=25)
+        self.ent_dvr_ip.insert(0, self.config.dvr_ip)
+        self.ent_dvr_ip.grid(row=1, column=1, padx=5, pady=2)
+
+        ttk.Label(form_frame, text="DVR CECO:").grid(row=1, column=2, sticky=tk.W, padx=5, pady=2)
+        self.ent_dvr_ceco = ttk.Entry(form_frame, width=25)
+        self.ent_dvr_ceco.insert(0, self.config.dvr_ceco)
+        self.ent_dvr_ceco.grid(row=1, column=3, padx=5, pady=2)
+        
+        ttk.Label(form_frame, text="DVR User:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
+        self.ent_dvr_user = ttk.Entry(form_frame, width=25)
+        self.ent_dvr_user.insert(0, self.config.dvr_user)
+        self.ent_dvr_user.grid(row=2, column=1, padx=5, pady=2)
+
+        ttk.Label(form_frame, text="DVR Pass:").grid(row=2, column=2, sticky=tk.W, padx=5, pady=2)
+        self.ent_dvr_pass = ttk.Entry(form_frame, width=25, show="*")
+        self.ent_dvr_pass.insert(0, self.config.dvr_pass)
+        self.ent_dvr_pass.grid(row=2, column=3, padx=5, pady=2)
+
+        ttk.Label(form_frame, text="Sync (min):").grid(row=3, column=0, sticky=tk.W, padx=5, pady=2)
+        self.ent_sync = ttk.Entry(form_frame, width=10)
+        self.ent_sync.insert(0, str(self.config.sync_interval))
+        self.ent_sync.grid(row=3, column=1, sticky=tk.W, padx=5, pady=2)
+
+        self.btn_start = ttk.Button(form_frame, text="Guardar e Iniciar", command=self.save_and_start)
+        self.btn_start.grid(row=3, column=3, sticky=tk.E, padx=5, pady=5)
+
+        log_frame = ttk.LabelFrame(self.root, text="Logs del Agente")
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.txt_log = scrolledtext.ScrolledText(log_frame, state='normal', height=15)
+        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.redirector = RedirectText(self.txt_log)
+        sys.stdout = self.redirector
+        sys.stderr = self.redirector
+        
+        print("-" * 50)
+        print(" Agente DVR ApuestaTotal (Python)")
+        print("-" * 50)
+
+    def save_and_start(self):
+        self.config.at_api_user = self.ent_at_user.get().strip()
+        self.config.at_api_pass = self.ent_at_pass.get().strip()
+        self.config.dvr_ip = self.ent_dvr_ip.get().strip()
+        self.config.dvr_user = self.ent_dvr_user.get().strip()
+        self.config.dvr_pass = self.ent_dvr_pass.get().strip()
+        self.config.dvr_ceco = self.ent_dvr_ceco.get().strip()
+        try:
+            self.config.sync_interval = int(self.ent_sync.get().strip())
+        except ValueError:
+            self.config.sync_interval = 5
+
+        if not self.config.dvr_ip:
+            print("[*] DVR IP vacío. Buscando DVR en la red local...")
+            def search_dvr():
+                devices = conecction_dvr.discover_hikvision(timeout=3)
+                if devices:
+                    d_ip = devices[0]['ip']
+                    d_port = devices[0].get('http_port', '80')
+                    ip_found = f"{d_ip}:{d_port}" if d_port and d_port != '80' else d_ip
+                    print(f"[+] DVR encontrado en: {ip_found}")
+                    self.root.after(0, lambda: self.ent_dvr_ip.insert(0, ip_found))
+                    self.config.dvr_ip = ip_found
+                    self.config.save()
+                    if self.config.is_valid():
+                        self.start_agent()
+                else:
+                    print("[-] No se encontró DVR automáticamente. Ingrese IP manualmente.")
+            threading.Thread(target=search_dvr, daemon=True).start()
+            return
+
+        self.config.save()
+        if self.config.is_valid():
+            self.start_agent()
+        else:
+            print("[-] Por favor complete todos los campos requeridos (Pass, CECO, etc).")
+
+    def start_agent(self):
+        self.btn_start.config(state=tk.DISABLED)
+        if self.worker_thread and self.worker_thread.is_alive():
+            print("[!] El agente ya está corriendo.")
+            return
+            
+        print("[*] Iniciando el worker en segundo plano...")
+        self.stop_event.clear()
+        self.worker_thread = threading.Thread(target=self.run_dvr_worker, daemon=True)
+        self.worker_thread.start()
+
+    def run_dvr_worker(self):
+        try:
+            dvr_worker(self.config, self.stop_event)
+        except Exception as e:
+            print(f"\n[!] Error critico en el agente: {e}")
+        finally:
+            self.root.after(0, lambda: self.btn_start.config(state=tk.NORMAL))
+
+    def create_image(self):
+        width = 64
+        height = 64
+        color1 = (0, 0, 0)
+        color2 = (255, 255, 255)
+        image = Image.new('RGB', (width, height), color1)
+        dc = ImageDraw.Draw(image)
+        dc.rectangle((width // 4, height // 4, width * 3 // 4, height * 3 // 4), fill=color2)
+        return image
+
+    def hide_window(self):
+        self.root.withdraw()
+        image = self.create_image()
+        menu = pystray.Menu(
+            pystray.MenuItem('Mostrar', self.show_window, default=True),
+            pystray.MenuItem('Salir', self.quit_window)
+        )
+        self.icon = pystray.Icon("dvr_agent", image, "DVR Agent AT", menu)
+        threading.Thread(target=self.icon.run, daemon=True).start()
+
+    def show_window(self, icon, item):
+        self.icon.stop()
+        self.root.after(0, self.root.deiconify)
+
+    def quit_window(self, icon, item):
+        self.icon.stop()
+        self.stop_event.set()
+        self.root.destroy()
+        os._exit(0)
 
 if __name__ == "__main__":
-    print("-" * 50)
-    print(" Agente DVR ApuestaTotal (Python)")
-    print("-" * 50)
-    config = Config()
-    
-    try:
-        dvr_worker(config)
-    except KeyboardInterrupt:
-        print("\n[*] Agente detenido manualmente.")
-    except Exception as e:
-        print(f"\n[!] Error critico en el agente: {e}")
+    root = tk.Tk()
+    app = DvrAgentApp(root)
+    root.mainloop()
