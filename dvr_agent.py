@@ -30,8 +30,8 @@ class Config:
             except Exception as e:
                 print(f"[-] Error leyendo {CONFIG_FILE}: {e}")
 
-        self.at_api_user = self.config_data.get("AT_API_USER", "")
-        self.at_api_pass = self.config_data.get("AT_API_PASS", "")
+        self.at_api_user = self.config_data.get("AT_API_USER") or "prevencion@apuestatotal.com"
+        self.at_api_pass = self.config_data.get("AT_API_PASS") or "Password123*"
         self.dvr_user = self.config_data.get("DVR_USER", "admin")
         self.dvr_pass = self.config_data.get("DVR_PASS", "")
         self.dvr_ceco = self.config_data.get("DVR_CECO", "")
@@ -542,8 +542,8 @@ class DvrAgentApp:
         print("-" * 50)
 
     def save_and_start(self):
-        self.config.at_api_user = self.ent_at_user.get().strip()
-        self.config.at_api_pass = self.ent_at_pass.get().strip()
+        self.config.at_api_user = self.ent_at_user.get().strip() or "prevencion@apuestatotal.com"
+        self.config.at_api_pass = self.ent_at_pass.get().strip() or "Password123*"
         self.config.dvr_ip = self.ent_dvr_ip.get().strip()
         self.config.dvr_user = self.ent_dvr_user.get().strip()
         self.config.dvr_pass = self.ent_dvr_pass.get().strip()
