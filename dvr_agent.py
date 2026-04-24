@@ -16,6 +16,7 @@ import pystray
 from PIL import Image, ImageDraw
 import re
 import glob
+import subprocess
 
 import conecction_dvr
 
@@ -533,6 +534,9 @@ class DvrAgentApp:
         self.btn_start = ttk.Button(form_frame, text="Guardar e Iniciar", command=self.save_and_start)
         self.btn_start.grid(row=3, column=3, sticky=tk.E, padx=5, pady=5)
 
+        self.btn_startup = ttk.Button(form_frame, text="Iniciar con Windows", command=self.add_to_startup)
+        self.btn_startup.grid(row=4, column=3, sticky=tk.E, padx=5, pady=5)
+
         log_frame = ttk.LabelFrame(self.root, text="Logs del Agente")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
@@ -635,6 +639,45 @@ class DvrAgentApp:
         except Exception as e:
             print(f"[-] Error modificando archivo OpenVPN: {e}")
             messagebox.showerror("Error", f"No se pudo modificar el archivo: {e}")
+
+    def add_to_startup(self):
+        try:
+            if getattr(sys, 'frozen', False):
+                app_path = sys.executable
+            else:
+                app_path = os.path.abspath(__file__)
+
+            appdata = os.environ.get('APPDATA', '')
+            if not appdata:
+                messagebox.showerror("Error", "No se pudo encontrar la ruta APPDATA.")
+                return
+
+            startup_folder = os.path.join(appdata, r'Microsoft\Windows\Start Menu\Programs\Startup')
+            if not os.path.exists(startup_folder):
+                messagebox.showerror("Error", f"No se encontro la carpeta de inicio: {startup_folder}")
+                return
+
+            base_name = os.path.splitext(os.path.basename(app_path))[0]
+            shortcut_path = os.path.join(startup_folder, f"{base_name}.lnk")
+            work_dir = os.path.dirname(app_path)
+
+            ps_script = f"""
+            $WshShell = New-Object -comObject WScript.Shell
+            $Shortcut = $WshShell.CreateShortcut('{shortcut_path}')
+            $Shortcut.TargetPath = '{app_path}'
+            $Shortcut.WorkingDirectory = '{work_dir}'
+            $Shortcut.Save()
+            """
+            
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            subprocess.run(["powershell", "-Command", ps_script], startupinfo=startupinfo, check=True)
+
+            print("[+] Agregado al inicio de Windows exitosamente.")
+            messagebox.showinfo("Éxito", f"Se creó el acceso directo en:\n{startup_folder}\n\nEl agente iniciará automáticamente con Windows.")
+        except Exception as e:
+            print(f"[-] Error al agregar al inicio: {e}")
+            messagebox.showerror("Error", f"No se pudo agregar al inicio: {e}")
 
     def start_agent(self):
         self.btn_start.config(state=tk.DISABLED)
