@@ -11,9 +11,11 @@ import requests
 from requests.auth import HTTPDigestAuth
 import queue
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 import pystray
 from PIL import Image, ImageDraw
+import re
+import glob
 
 import conecction_dvr
 
@@ -36,7 +38,7 @@ class Config:
         self.dvr_pass = self.config_data.get("DVR_PASS", "")
         self.dvr_ceco = self.config_data.get("DVR_CECO", "")
         self.dvr_ip = self.config_data.get("DVR_IP", "")
-        self.sync_interval = self.config_data.get("SYNC_INTERVAL_MINUTES", 5)
+        self.sync_interval = self.config_data.get("SYNC_INTERVAL_MINUTES", 15)
 
     def save(self):
         self.config_data["AT_API_USER"] = self.at_api_user
@@ -404,6 +406,7 @@ def dvr_worker(config, stop_event):
     print("[*] ¡Validación exitosa! Ejecutando en segundo plano...")
     
     def handle_event(event_data):
+        print(f"[*] Evento detectado desde DVR: {event_data['eventType']} en cámara {event_data.get('channel', '0')}")
         event_payload = {
             "eventType": event_data["eventType"],
             "eventTime": get_current_utc(),
@@ -524,6 +527,9 @@ class DvrAgentApp:
         self.ent_sync.insert(0, str(self.config.sync_interval))
         self.ent_sync.grid(row=3, column=1, sticky=tk.W, padx=5, pady=2)
 
+        self.btn_fix_vpn = ttk.Button(form_frame, text="Arreglar VPN (Opcional)", command=self.fix_vpn_route)
+        self.btn_fix_vpn.grid(row=3, column=2, sticky=tk.E, padx=5, pady=5)
+
         self.btn_start = ttk.Button(form_frame, text="Guardar e Iniciar", command=self.save_and_start)
         self.btn_start.grid(row=3, column=3, sticky=tk.E, padx=5, pady=5)
 
@@ -577,6 +583,58 @@ class DvrAgentApp:
             self.start_agent()
         else:
             print("[-] Por favor complete todos los campos requeridos (Pass, CECO, etc).")
+
+    def fix_vpn_route(self):
+        dvr_ip_full = self.ent_dvr_ip.get().strip()
+        if not dvr_ip_full:
+            messagebox.showwarning("Falta IP", "Primero ingresa la IP del DVR o dale a Iniciar para que la busque automáticamente.")
+            return
+
+        # Limpiar IP (quitar puerto si lo tiene)
+        dvr_ip = dvr_ip_full.split(':')[0]
+        
+        appdata = os.environ.get('APPDATA', '')
+        profiles_dir = os.path.join(appdata, 'OpenVPN Connect', 'profiles')
+        
+        ovpn_file = None
+        if os.path.exists(profiles_dir):
+            files = glob.glob(os.path.join(profiles_dir, '*.ovpn'))
+            for f in files:
+                basename = os.path.basename(f)
+                if re.match(r'^\d', basename):
+                    ovpn_file = f
+                    break
+        
+        if not ovpn_file:
+            messagebox.showinfo("No encontrado", "No pude encontrar el archivo de OpenVPN automáticamente. Por favor selecciónalo.")
+            ovpn_file = filedialog.askopenfilename(
+                title="Selecciona tu archivo .ovpn",
+                filetypes=[("OpenVPN Config", "*.ovpn")]
+            )
+
+        if not ovpn_file:
+            return
+
+        try:
+            with open(ovpn_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            route_line = f"route {dvr_ip} 255.255.255.255 net_gateway"
+            if route_line in content:
+                print(f"[*] La ruta para {dvr_ip} ya existe en el archivo OpenVPN.")
+                messagebox.showinfo("Ya existe", "La ruta ya estaba agregada. Si sigue fallando, desconecta y reconecta la VPN.")
+                return
+
+            with open(ovpn_file, 'a', encoding='utf-8') as f:
+                if not content.endswith('\n'):
+                    f.write('\n')
+                f.write(route_line + '\n')
+            
+            print(f"[+] ¡Ruta agregada exitosamente en {os.path.basename(ovpn_file)}!")
+            messagebox.showinfo("¡Éxito!", f"Se agregó la excepción para la IP {dvr_ip}.\n\nPara que haga efecto, DEBES desconectar tu OpenVPN y volver a conectarlo ahora mismo.")
+        except Exception as e:
+            print(f"[-] Error modificando archivo OpenVPN: {e}")
+            messagebox.showerror("Error", f"No se pudo modificar el archivo: {e}")
 
     def start_agent(self):
         self.btn_start.config(state=tk.DISABLED)
