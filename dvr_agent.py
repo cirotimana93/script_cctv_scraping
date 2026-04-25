@@ -354,76 +354,95 @@ class HikvisionClient:
             print(f"[-] Error obteniendo recordingStatus: {e}")
             return []
 
-    def stream_events(self, on_event_callback):
+    def stream_events(self, on_event_callback, stop_event):
         url = f"{self.base_url}/ISAPI/Event/notification/alertStream"
-        print(f"[*] Iniciando conexion al stream de eventos: {url}")
-        try:
-            with requests.get(url, auth=self.auth, stream=True, timeout=(15, None)) as resp:
-                resp.raise_for_status()
-                buffer = ""
-                for line in resp.iter_lines(decode_unicode=True):
-                    if line:
-                        if isinstance(line, bytes):
-                            line = line.decode('utf-8', errors='ignore')
-                        buffer += line
-                        if "</EventNotificationAlert>" in line:
-                            try:
-                                root = ET.fromstring(buffer)
-                                namespace = ""
-                                if "}" in root.tag:
-                                    namespace = root.tag.split("}")[0] + "}"
+        while not stop_event.is_set():
+            print(f"[*] Iniciando conexion al stream de eventos: {url}")
+            try:
+                with requests.get(url, auth=self.auth, stream=True, timeout=(15, None)) as resp:
+                    resp.raise_for_status()
+                    buffer = ""
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if stop_event.is_set():
+                            break
+                        if line:
+                            if isinstance(line, bytes):
+                                line = line.decode('utf-8', errors='ignore')
+                            buffer += line
+                            if "</EventNotificationAlert>" in line:
+                                try:
+                                    root = ET.fromstring(buffer)
+                                    namespace = ""
+                                    if "}" in root.tag:
+                                        namespace = root.tag.split("}")[0] + "}"
+                                        
+                                    event_type = root.find(f"{namespace}eventType").text if root.find(f"{namespace}eventType") is not None else "unknown"
+                                    event_state = root.find(f"{namespace}eventState").text if root.find(f"{namespace}eventState") is not None else ""
+                                    ch_id = root.find(f"{namespace}channelID").text if root.find(f"{namespace}channelID") is not None else "0"
                                     
-                                event_type = root.find(f"{namespace}eventType").text if root.find(f"{namespace}eventType") is not None else "unknown"
-                                event_state = root.find(f"{namespace}eventState").text if root.find(f"{namespace}eventState") is not None else ""
-                                ch_id = root.find(f"{namespace}channelID").text if root.find(f"{namespace}channelID") is not None else "0"
-                                
-                                # Solo procesamos eventos activos o utiles
-                                if event_state == "active" or not event_state:
-                                    on_event_callback({
-                                        "eventType": event_type,
-                                        "channel": ch_id
-                                    })
-                            except ET.ParseError:
-                                pass
-                            buffer = ""
-        except Exception as e:
-            print(f"[-] Stream de eventos desconectado o error: {e}")
+                                    # Solo procesamos eventos activos o utiles
+                                    if event_state == "active" or not event_state:
+                                        on_event_callback({
+                                            "eventType": event_type,
+                                            "channel": ch_id
+                                        })
+                                except ET.ParseError:
+                                    pass
+                                buffer = ""
+            except Exception as e:
+                print(f"[-] Stream de eventos desconectado o error: {e}")
+                
+            if not stop_event.is_set():
+                print("[*] Reintentando conexion del stream de eventos en 10s...")
+                stop_event.wait(10)
 
 def get_current_utc():
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
-def dvr_worker(config, stop_event):
+def dvr_worker(config, stop_event, is_autostart=False):
     at_client = ApuestaTotalClient(config.at_api_user, config.at_api_pass)
-    if not at_client.login():
-        print("[-] Abortando ejecucion por fallo de login.")
-        return
-
     hik_client = HikvisionClient(config.dvr_ip, config.dvr_user, config.dvr_pass)
-    device_info = hik_client.fetch_device_info()
-    if not device_info:
-        print("[-] Abortando ejecucion, no se pudo contactar el DVR.")
-        return
-
-    print("[*] ¡Validación exitosa! Ejecutando en segundo plano...")
-    
-    def handle_event(event_data):
-        print(f"[*] Evento detectado desde DVR: {event_data['eventType']} en cámara {event_data.get('channel', '0')}")
-        event_payload = {
-            "eventType": event_data["eventType"],
-            "eventTime": get_current_utc(),
-            "dvrName": device_info.get("dvrName", ""),
-            "dvrSerialNumber": device_info.get("dvrSerialNumber", ""),
-            "externalId": config.dvr_ceco,
-            "cameraName": f"Camera {event_data.get('channel', '0')}",
-            "status": "new",
-            "observations": ""
-        }
-        at_client.post_event(event_payload)
-
-    event_thread = threading.Thread(target=hik_client.stream_events, args=(handle_event,), daemon=True)
-    event_thread.start()
+    device_info = None
 
     while not stop_event.is_set():
+        if not at_client.token:
+            if not at_client.login():
+                if not is_autostart:
+                    print("[-] Fallo de login AT. Verifica tus credenciales. Deteniendo ejecución manual.")
+                    return
+                print("[-] Fallo de login AT. Reintentando en 30s...")
+                stop_event.wait(30)
+                continue
+
+        if not device_info:
+            device_info = hik_client.fetch_device_info()
+            if not device_info:
+                if not is_autostart:
+                    print("[-] No se pudo contactar el DVR. Verifica IP/Credenciales o VPN. Deteniendo ejecución manual.")
+                    return
+                print("[-] No se pudo contactar el DVR. Reintentando en 30s...")
+                stop_event.wait(30)
+                continue
+
+            print("[*] ¡Validación exitosa! Ejecutando en segundo plano...")
+            
+            def handle_event(event_data):
+                print(f"[*] Evento detectado desde DVR: {event_data['eventType']} en cámara {event_data.get('channel', '0')}")
+                event_payload = {
+                    "eventType": event_data["eventType"],
+                    "eventTime": get_current_utc(),
+                    "dvrName": device_info.get("dvrName", ""),
+                    "dvrSerialNumber": device_info.get("dvrSerialNumber", ""),
+                    "externalId": config.dvr_ceco,
+                    "cameraName": f"Camera {event_data.get('channel', '0')}",
+                    "status": "new",
+                    "observations": ""
+                }
+                at_client.post_event(event_payload)
+
+            event_thread = threading.Thread(target=hik_client.stream_events, args=(handle_event, stop_event), daemon=True)
+            event_thread.start()
+
         print(f"\n[*] [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Recolectando status de grabacion y almacenamiento...")
         
         storage_list = hik_client.fetch_storage_status()
@@ -488,6 +507,8 @@ class DvrAgentApp:
 
         if self.config.is_valid():
             self.start_agent()
+            if '--autostart' in sys.argv:
+                self.root.after(100, self.hide_window)
 
     def setup_ui(self):
         form_frame = ttk.LabelFrame(self.root, text="Configuración")
@@ -665,6 +686,7 @@ class DvrAgentApp:
             $WshShell = New-Object -comObject WScript.Shell
             $Shortcut = $WshShell.CreateShortcut('{shortcut_path}')
             $Shortcut.TargetPath = '{app_path}'
+            $Shortcut.Arguments = '--autostart'
             $Shortcut.WorkingDirectory = '{work_dir}'
             $Shortcut.Save()
             """
@@ -685,14 +707,16 @@ class DvrAgentApp:
             print("[!] El agente ya está corriendo.")
             return
             
+        is_autostart = ('--autostart' in sys.argv)
+            
         print("[*] Iniciando el worker en segundo plano...")
         self.stop_event.clear()
-        self.worker_thread = threading.Thread(target=self.run_dvr_worker, daemon=True)
+        self.worker_thread = threading.Thread(target=self.run_dvr_worker, args=(is_autostart,), daemon=True)
         self.worker_thread.start()
 
-    def run_dvr_worker(self):
+    def run_dvr_worker(self, is_autostart):
         try:
-            dvr_worker(self.config, self.stop_event)
+            dvr_worker(self.config, self.stop_event, is_autostart)
         except Exception as e:
             print(f"\n[!] Error critico en el agente: {e}")
         finally:
