@@ -57,7 +57,7 @@ class Config:
             print(f"[-] Error guardando {CONFIG_FILE}: {e}")
 
     def is_valid(self):
-        return all([self.at_api_user, self.at_api_pass, self.dvr_user, self.dvr_pass, self.dvr_ceco, self.dvr_ip])
+        return all([self.at_api_user, self.at_api_pass, self.dvr_user, self.dvr_pass, self.dvr_ceco])
 
 class ApuestaTotalClient:
     def __init__(self, user, password):
@@ -173,6 +173,67 @@ class HikvisionClient:
         except Exception as e:
             print(f"[-] Error obteniendo storageStatus: {e}")
             return []
+
+    def make_ip_static(self):
+        url = f"{self.base_url}/ISAPI/System/Network/interfaces/1/ipAddress"
+        try:
+            resp = requests.get(url, auth=self.auth, timeout=15)
+            resp.raise_for_status()
+            
+            root = ET.fromstring(resp.content)
+            ns = root.tag.split("}")[0] + "}" if "}" in root.tag else ""
+            ns_str = ns.strip("{}") if ns else "http://www.hikvision.com/ver20/XMLSchema"
+            
+            addressing_type = root.find(f"{ns}addressingType")
+            if addressing_type is not None and addressing_type.text == "dynamic":
+                ip_version = root.find(f"{ns}ipVersion").text if root.find(f"{ns}ipVersion") is not None else "v4"
+                ip_address = root.find(f"{ns}ipAddress").text if root.find(f"{ns}ipAddress") is not None else ""
+                subnet = root.find(f"{ns}subnetMask").text if root.find(f"{ns}subnetMask") is not None else ""
+                
+                gw_node = root.find(f"{ns}DefaultGateway")
+                gw_ip = gw_node.find(f"{ns}ipAddress").text if gw_node is not None and gw_node.find(f"{ns}ipAddress") is not None else ""
+                
+                pdns_node = root.find(f"{ns}PrimaryDNS")
+                pdns_ip = pdns_node.find(f"{ns}ipAddress").text if pdns_node is not None and pdns_node.find(f"{ns}ipAddress") is not None else ""
+                
+                sdns_node = root.find(f"{ns}SecondaryDNS")
+                sdns_ip = sdns_node.find(f"{ns}ipAddress").text if sdns_node is not None and sdns_node.find(f"{ns}ipAddress") is not None else ""
+                
+                xml_payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<IPAddress version="2.0" xmlns="{ns_str}">
+    <ipVersion>{ip_version}</ipVersion>
+    <addressingType>static</addressingType>
+    <ipAddress>{ip_address}</ipAddress>
+    <subnetMask>{subnet}</subnetMask>"""
+                if gw_ip:
+                    xml_payload += f"""\n    <DefaultGateway>
+        <ipAddress>{gw_ip}</ipAddress>
+    </DefaultGateway>"""
+                if pdns_ip:
+                    xml_payload += f"""\n    <PrimaryDNS>
+        <ipAddress>{pdns_ip}</ipAddress>
+    </PrimaryDNS>"""
+                if sdns_ip:
+                    xml_payload += f"""\n    <SecondaryDNS>
+        <ipAddress>{sdns_ip}</ipAddress>
+    </SecondaryDNS>"""
+                
+                xml_payload += "\n</IPAddress>"
+                
+                put_resp = requests.put(url, auth=self.auth, data=xml_payload.encode('utf-8'), headers={"Content-Type": "application/xml"}, timeout=15)
+                
+                if put_resp.status_code != 200:
+                    return False, f"El DVR rechazó la solicitud ({put_resp.status_code}): {put_resp.text}"
+                    
+                return True, "Se configuró la IP estática exitosamente en el DVR."
+            elif addressing_type is not None and addressing_type.text == "static":
+                return True, "El DVR ya tiene configurada una IP estática. No se requieren cambios."
+            else:
+                return False, "No se encontró el formato esperado en la red del DVR."
+        except requests.exceptions.HTTPError as e:
+            return False, f"Error del servidor DVR: {e.response.status_code} - {e.response.text}"
+        except Exception as e:
+            return False, f"Error comunicando con el DVR: {e}"
 
     def fetch_track_ids(self):
         try:
@@ -399,7 +460,63 @@ class HikvisionClient:
 def get_current_utc():
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
-def dvr_worker(config, stop_event, is_autostart=False):
+def auto_patch_ovpn(new_ip):
+    appdata = os.environ.get('APPDATA', '')
+    profiles_dir = os.path.join(appdata, 'OpenVPN Connect', 'profiles')
+    
+    ovpn_file = None
+    if os.path.exists(profiles_dir):
+        files = glob.glob(os.path.join(profiles_dir, '*.ovpn'))
+        for f in files:
+            basename = os.path.basename(f)
+            if re.match(r'^\d', basename):
+                ovpn_file = f
+                break
+
+    if not ovpn_file:
+        print("[-] No se encontró archivo .ovpn automático para parchear.")
+        return
+
+    try:
+        with open(ovpn_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Limpiar rutas viejas insertadas por el bot
+        content = re.sub(r'route \d+\.\d+\.\d+\.\d+ 255\.255\.255\.255 (net_gateway|vpn_gateway)\n?', '', content)
+        content = content.strip() + '\n'
+
+        route_line = f"route {new_ip} 255.255.255.255 net_gateway\n"
+        content += route_line
+
+        with open(ovpn_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        print(f"[+] Archivo {os.path.basename(ovpn_file)} parcheado con nueva ruta: {new_ip}")
+    except Exception as e:
+        print(f"[-] Error auto-parcheando OpenVPN: {e}")
+
+def dvr_worker(config, stop_event, is_autostart=False, on_ip_update_callback=None):
+    print("[*] Realizando escaneo de red en busca de DVR...")
+    devices = conecction_dvr.discover_hikvision(timeout=3)
+    found_ip = None
+    if devices:
+        d_ip = devices[0]['ip']
+        d_port = devices[0].get('http_port', '80')
+        found_ip = f"{d_ip}:{d_port}" if d_port and d_port != '80' else d_ip
+        
+    if found_ip:
+        if found_ip != config.dvr_ip:
+            print(f"[*] IP del DVR cambió o fue detectada: de '{config.dvr_ip}' a '{found_ip}'. Actualizando...")
+            config.dvr_ip = found_ip
+            config.save()
+            auto_patch_ovpn(found_ip)
+            if on_ip_update_callback:
+                on_ip_update_callback(found_ip)
+        else:
+            print(f"[*] IP del DVR confirmada por escaneo: {found_ip}")
+    else:
+        print(f"[-] Escaneo SADP no encontró DVR. Se usará IP guardada: {config.dvr_ip}")
+
     at_client = ApuestaTotalClient(config.at_api_user, config.at_api_pass)
     hik_client = HikvisionClient(config.dvr_ip, config.dvr_user, config.dvr_pass)
     device_info = None
@@ -555,6 +672,9 @@ class DvrAgentApp:
         self.btn_start = ttk.Button(form_frame, text="Guardar e Iniciar", command=self.save_and_start)
         self.btn_start.grid(row=3, column=3, sticky=tk.E, padx=5, pady=5)
 
+        self.btn_fix_ip = ttk.Button(form_frame, text="Fijar IP Estática", command=self.fix_static_ip)
+        self.btn_fix_ip.grid(row=4, column=2, sticky=tk.E, padx=5, pady=5)
+
         self.btn_startup = ttk.Button(form_frame, text="Iniciar con Windows", command=self.add_to_startup)
         self.btn_startup.grid(row=4, column=3, sticky=tk.E, padx=5, pady=5)
 
@@ -583,25 +703,6 @@ class DvrAgentApp:
             self.config.sync_interval = int(self.ent_sync.get().strip())
         except ValueError:
             self.config.sync_interval = 5
-
-        if not self.config.dvr_ip:
-            print("[*] DVR IP vacío. Buscando DVR en la red local...")
-            def search_dvr():
-                devices = conecction_dvr.discover_hikvision(timeout=3)
-                if devices:
-                    d_ip = devices[0]['ip']
-                    d_port = devices[0].get('http_port', '80')
-                    ip_found = f"{d_ip}:{d_port}" if d_port and d_port != '80' else d_ip
-                    print(f"[+] DVR encontrado en: {ip_found}")
-                    self.root.after(0, lambda: self.ent_dvr_ip.insert(0, ip_found))
-                    self.config.dvr_ip = ip_found
-                    self.config.save()
-                    if self.config.is_valid():
-                        self.start_agent()
-                else:
-                    print("[-] No se encontró DVR automáticamente. Ingrese IP manualmente.")
-            threading.Thread(target=search_dvr, daemon=True).start()
-            return
 
         self.config.save()
         if self.config.is_valid():
@@ -661,6 +762,26 @@ class DvrAgentApp:
             print(f"[-] Error modificando archivo OpenVPN: {e}")
             messagebox.showerror("Error", f"No se pudo modificar el archivo: {e}")
 
+    def fix_static_ip(self):
+        dvr_ip_full = self.ent_dvr_ip.get().strip()
+        dvr_user = self.ent_dvr_user.get().strip()
+        dvr_pass = self.ent_dvr_pass.get().strip()
+        
+        if not dvr_ip_full or not dvr_user or not dvr_pass:
+            messagebox.showwarning("Faltan datos", "Para fijar la IP, primero ingresa la IP actual, el Usuario y la Contraseña del DVR en la interfaz.")
+            return
+
+        print(f"[*] Solicitando fijar IP estática para {dvr_ip_full}...")
+        hik_client = HikvisionClient(dvr_ip_full, dvr_user, dvr_pass)
+        success, msg = hik_client.make_ip_static()
+        
+        if success:
+            print(f"[+] {msg}")
+            messagebox.showinfo("Éxito", msg)
+        else:
+            print(f"[-] {msg}")
+            messagebox.showerror("Error", msg)
+
     def add_to_startup(self):
         try:
             if getattr(sys, 'frozen', False):
@@ -711,12 +832,16 @@ class DvrAgentApp:
             
         print("[*] Iniciando el worker en segundo plano...")
         self.stop_event.clear()
-        self.worker_thread = threading.Thread(target=self.run_dvr_worker, args=(is_autostart,), daemon=True)
+        
+        def update_ui_ip(new_ip):
+            self.root.after(0, lambda: [self.ent_dvr_ip.delete(0, tk.END), self.ent_dvr_ip.insert(0, new_ip)])
+            
+        self.worker_thread = threading.Thread(target=self.run_dvr_worker, args=(is_autostart, update_ui_ip), daemon=True)
         self.worker_thread.start()
 
-    def run_dvr_worker(self, is_autostart):
+    def run_dvr_worker(self, is_autostart, update_ui_ip):
         try:
-            dvr_worker(self.config, self.stop_event, is_autostart)
+            dvr_worker(self.config, self.stop_event, is_autostart, update_ui_ip)
         except Exception as e:
             print(f"\n[!] Error critico en el agente: {e}")
         finally:
