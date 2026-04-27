@@ -235,6 +235,22 @@ class HikvisionClient:
         except Exception as e:
             return False, f"Error comunicando con el DVR: {e}"
 
+    def change_device_name(self, new_name):
+        url = f"{self.base_url}/ISAPI/System/deviceInfo"
+        xml_payload = f"""<?xml version="1.0" encoding="UTF-8"?>
+<DeviceInfo version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">
+    <deviceName>{new_name}</deviceName>
+</DeviceInfo>"""
+        try:
+            put_resp = requests.put(url, auth=self.auth, data=xml_payload.encode('utf-8'), headers={"Content-Type": "application/xml"}, timeout=15)
+            if put_resp.status_code != 200:
+                return False, f"El DVR rechazó la solicitud ({put_resp.status_code}): {put_resp.text}"
+            return True, f"Nombre del DVR cambiado a '{new_name}' exitosamente."
+        except requests.exceptions.HTTPError as e:
+            return False, f"Error del servidor DVR: {e.response.status_code} - {e.response.text}"
+        except Exception as e:
+            return False, f"Error comunicando con el DVR: {e}"
+
     def fetch_track_ids(self):
         try:
             resp = requests.get(f"{self.base_url}/ISAPI/ContentMgmt/record/tracks", auth=self.auth, timeout=15)
@@ -678,6 +694,9 @@ class DvrAgentApp:
         self.btn_startup = ttk.Button(form_frame, text="Iniciar con Windows", command=self.add_to_startup)
         self.btn_startup.grid(row=4, column=3, sticky=tk.E, padx=5, pady=5)
 
+        self.btn_rename_dvr = ttk.Button(form_frame, text="Cambiar Nombre DVR", command=self.rename_dvr)
+        self.btn_rename_dvr.grid(row=5, column=2, sticky=tk.E, padx=5, pady=5)
+
         log_frame = ttk.LabelFrame(self.root, text="Logs del Agente")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
@@ -774,6 +793,51 @@ class DvrAgentApp:
         print(f"[*] Solicitando fijar IP estática para {dvr_ip_full}...")
         hik_client = HikvisionClient(dvr_ip_full, dvr_user, dvr_pass)
         success, msg = hik_client.make_ip_static()
+        
+        if success:
+            print(f"[+] {msg}")
+            messagebox.showinfo("Éxito", msg)
+        else:
+            print(f"[-] {msg}")
+            messagebox.showerror("Error", msg)
+
+    def rename_dvr(self):
+        from tkinter import simpledialog
+        dvr_ip_full = self.ent_dvr_ip.get().strip()
+        dvr_user = self.ent_dvr_user.get().strip()
+        dvr_pass = self.ent_dvr_pass.get().strip()
+        ceco = self.ent_dvr_ceco.get().strip()
+        
+        if not dvr_ip_full or not dvr_user or not dvr_pass:
+            messagebox.showwarning("Faltan datos", "Para cambiar el nombre, primero ingresa la IP actual, el Usuario y la Contraseña del DVR.")
+            return
+
+        new_name = None
+
+        if ceco:
+            try:
+                store_file = "store.json"
+                if os.path.exists(store_file):
+                    with open(store_file, 'r', encoding='utf-8') as f:
+                        stores = json.load(f)
+                        for s in stores:
+                            if str(s.get("CECO")) == str(ceco):
+                                new_name = s.get("Tienda")
+                                break
+                else:
+                    print(f"[-] No se encontró el archivo {store_file}")
+            except Exception as e:
+                print(f"[-] Error leyendo store.json: {e}")
+
+        if not new_name:
+            new_name = simpledialog.askstring("Cambiar Nombre", "No se encontró el CECO o no hay archivo. Ingresa el nuevo nombre para el DVR:")
+            
+        if not new_name:
+            return
+
+        print(f"[*] Solicitando cambiar nombre a '{new_name}'...")
+        hik_client = HikvisionClient(dvr_ip_full, dvr_user, dvr_pass)
+        success, msg = hik_client.change_device_name(new_name)
         
         if success:
             print(f"[+] {msg}")
